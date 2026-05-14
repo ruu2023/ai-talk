@@ -22,111 +22,207 @@
     </style>
   </head>
   <body>
-    <h1>ずんだもんと雑談</h1>
     <button id="startBtn">音声認識を開始</button>
-    <p id="status">ボタンを押して話しかけてください</p>
+    <p id="status">ボタンを押してください</p>
     <script src="config.js"></script>
     <script>
       // ==========================================
-      // 1. 設定
+      // 1. 設定・状態管理
       // ==========================================
+      const SPEAKER_ID = 2; // 四国めたん（ノーマル）
+      let chatHistory = [];
+      const MAX_HISTORY = 4;
+      let isAIspeaking = false;
 
-      const REQUESTY_ENDPOINT =
-        "https://router.requesty.ai/v1/chat/completions";
-      const REQUESTY_API_KEY = CONFIG.REQUESTY_API_KEY;
-      const SPEAKER_ID = 3; // ずんだもん（ノーマル）のID
-      const startBtn = document.getElementById("startBtn");
-      const statusText = document.getElementById("status");
-
-      // 音声再生のバッティングを防ぐためのキュー
+      // --- 追加：再生キュー用の管理変数 ---
       let audioQueue = [];
       let isPlaying = false;
 
-      // ボタンクリックで開始
-      startBtn.addEventListener("click", () => {
-        // 2回目以降のクリックで多重起動しないよう無効化
-        startBtn.disabled = true;
-        startConversation();
-      });
+      const startBtn = document.getElementById("startBtn");
+      const statusText = document.getElementById("status");
 
-      async function startConversation() {
-        const recognition = new (
-          window.SpeechRecognition || window.webkitSpeechRecognition
-        )();
-        recognition.lang = "ja-JP";
-
-        recognition.onstart = () => {
-          statusText.textContent = "聴いてるのだ！話してほしいのだ。";
-        };
-
-        recognition.onresult = async (event) => {
-          const userText = event.results[0][0].transcript;
-          statusText.textContent = `あなた: ${userText}`;
-
-          const response = await fetch(REQUESTY_ENDPOINT, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              Authorization: `Bearer ${REQUESTY_API_KEY}`,
-            },
-            body: JSON.stringify({
-              model: "openai/gpt-4o-mini",
-              stream: true, // ストリーミング有効
-              messages: [
-                {
-                  role: "system",
-                  content:
-                    "あなたはずんだもんです。語尾に「なのだ」をつけて。短く1、2文で。",
-                },
-                { role: "user", content: userText },
-              ],
-            }),
-          });
-          const reader = response.body.getReader();
-          const decoder = new TextDecoder("utf-8");
-          let currentSentence = ""; // 音声用（句読点で区切る）
-          let displayBuffer = ""; // 画面表示用（全部溜める）
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-
-            const chunk = decoder.decode(value, { stream: true });
-            const lines = chunk.split("\n");
-
-            for (const line of lines) {
-              if (line.startsWith("data: ") && line !== "data: [DONE]") {
-                try {
-                  const json = JSON.parse(line.substring(6));
-                  const content = json.choices[0].delta.content || "";
-
-                  // 1. 画面表示用のバッファに追加
-                  displayBuffer += content;
-                  // 2. リアルタイムに画面を書き換え
-                  statusText.innerHTML = `あなた: ${userText}<br>ずんだもん: ${displayBuffer}`;
-
-                  // 3. 音声用のバッファに追加
-                  currentSentence += content;
-                  if (/[。？！\n]/.test(content)) {
-                    enqueueAudio(currentSentence.trim());
-                    currentSentence = "";
-                  }
-                } catch (e) {
-                  console.error("JSON parse error", e);
-                }
-              }
-            }
-          }
-          // 最後にボタンを戻す（または認識をループさせる）
-          startBtn.disabled = false;
-        };
-
-        recognition.start();
+      // --- 追加：システム初期化（空でも定義が必要） ---
+      async function initializeSystem() {
+        console.log("System Initializing...");
+        // 必要ならここで設定ファイルの読み込みなどを行う
       }
 
-      // --- 音声再生管理システム ---
+      // --- 追加：再生が完全に終わるのを待つ関数 ---
+      function waitForAudioEnd() {
+        return new Promise((resolve) => {
+          const checkInterval = setInterval(() => {
+            if (!isPlaying && audioQueue.length === 0) {
+              clearInterval(checkInterval);
+              resolve();
+            }
+          }, 100);
+        });
+      }
 
-      async function enqueueAudio(text) {
+      // ==========================================
+      // 2. 起動処理
+      // ==========================================
+      startBtn.addEventListener("click", async () => {
+        startBtn.disabled = true;
+        startBtn.textContent = "稼働中...";
+        await initializeSystem();
+        await initialGreeting();
+      });
+
+      async function initialGreeting() {
+        const greeting = "私に聞きたいことがあるんじゃないの？";
+        statusText.innerHTML = `紅莉栖: ${greeting}`;
+        chatHistory.push({ role: "assistant", content: greeting });
+
+        isAIspeaking = true;
+        await enqueueAudio(greeting);
+        await waitForAudioEnd(); // 全て喋り終わるまで待機
+        isAIspeaking = false;
+
+        // 最初の認識スタート
+        try {
+          recognition.start();
+        } catch (e) {}
+      }
+
+      // ==========================================
+      // 3. 音声認識 (Web Speech API)
+      // ==========================================
+      const recognition = new (
+        window.SpeechRecognition || window.webkitSpeechRecognition
+      )();
+      recognition.lang = "ja-JP";
+      recognition.continuous = false;
+
+      recognition.onresult = async (event) => {
+        const userText = event.results[0][0].transcript;
+        statusText.textContent = `あなた: ${userText}`;
+        chatHistory.push({ role: "user", content: userText });
+
+        const aiResponseText = await callRequestyAPI();
+
+        chatHistory.push({ role: "assistant", content: aiResponseText });
+        while (chatHistory.length > MAX_HISTORY) {
+          chatHistory.shift();
+        }
+      };
+
+      recognition.onend = () => {
+        // AIが喋っておらず、かつボタンが押された後なら再起動
+        if (!isAIspeaking && startBtn.disabled) {
+          try {
+            recognition.start();
+          } catch (e) {}
+        }
+      };
+
+      // ==========================================
+      // 4. API連携 (Requesty)
+      // ==========================================
+      async function callRequestyAPI() {
+        const REQUESTY_ENDPOINT =
+          "https://router.requesty.ai/v1/chat/completions";
+        const REQUESTY_API_KEY = CONFIG.REQUESTY_API_KEY;
+
+        // prompt.txtの読み込み（エラーハンドリング付き）
+        let systemPrompt = "あなたは牧瀬紅莉栖です。";
+        try {
+          const res = await fetch("prompt.txt");
+          systemPrompt = await res.text();
+        } catch (e) {
+          console.error("Prompt file not found.");
+        }
+
+        const response = await fetch(REQUESTY_ENDPOINT, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${REQUESTY_API_KEY}`,
+          },
+          body: JSON.stringify({
+            model: "openai/gpt-4o-mini",
+            stream: true,
+            messages: [
+              { role: "system", content: systemPrompt },
+              ...chatHistory,
+            ],
+          }),
+        });
+
+        return await handleStreamAndPlay(response);
+      }
+
+      async function handleStreamAndPlay(response) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let fullText = ""; // 履歴保存用の全文
+        let currentSentence = ""; // 音声合成用の1文
+        let displayBuffer = ""; // 画面表示用の文字
+
+        isAIspeaking = true;
+
+        // 現在のユーザーの発言を取得（直近の履歴から）
+        const userText = chatHistory[chatHistory.length - 1].content;
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split("\n");
+
+          for (const line of lines) {
+            if (line.startsWith("data: ") && line !== "data: [DONE]") {
+              try {
+                const json = JSON.parse(line.substring(6));
+                const content = json.choices[0].delta.content || "";
+
+                // 1. 全文と表示バッファに蓄積
+                fullText += content;
+                displayBuffer += content;
+
+                // 2. 画面を更新（あなたとAIの両方を表示）
+                statusText.innerHTML = `
+              <div style="color: #666; margin-bottom: 10px;">あなた: ${userText}</div>
+              <div style="font-weight: bold; color: #d63384;">紅莉栖: ${displayBuffer}<span class="cursor">|</span></div>
+            `;
+
+                // 3. 音声合成用に溜める
+                currentSentence += content;
+                if (/[。！？\n]/.test(content)) {
+                  enqueueAudio(currentSentence.trim());
+                  currentSentence = "";
+                }
+              } catch (e) {}
+            }
+          }
+        }
+
+        // 残りの文章があれば音声キューへ
+        if (currentSentence.trim()) {
+          enqueueAudio(currentSentence.trim());
+        }
+
+        // カーソルを消す
+        statusText.innerHTML = `
+      <div style="color: #666; margin-bottom: 10px;">あなた: ${userText}</div>
+      <div style="font-weight: bold; color: #d63384;">紅莉栖: ${displayBuffer}</div>
+    `;
+
+        await waitForAudioEnd();
+        isAIspeaking = false;
+
+        try {
+          recognition.start();
+        } catch (e) {}
+
+        return fullText;
+      }
+
+      // ==========================================
+      // 5. 音声再生管理システム (VOICEVOX)
+      // ==========================================
+      function enqueueAudio(text) {
         if (!text) return;
         audioQueue.push(text);
         if (!isPlaying) {
@@ -142,39 +238,40 @@
 
         isPlaying = true;
         const text = audioQueue.shift();
-
-        // VOICEVOXで音声生成＆再生
         await playVoice(text);
-
-        // 再生完了を待ってから次へ（playVoice関数内で再生終了を待機する実装が必要）
-        processQueue();
+        processQueue(); // 再帰的に次のキューを処理
       }
 
-      // playVoice関数を「再生が終わるまでresolveしないPromise」にすると完璧です
       async function playVoice(text) {
-        const SPEAKER_ID = 3;
-        const queryRes = await fetch(
-          `http://localhost:50021/audio_query?text=${encodeURIComponent(text)}&speaker=${SPEAKER_ID}`,
-          { method: "POST" },
-        );
-        const queryJson = await queryRes.json();
-        const synthRes = await fetch(
-          `http://localhost:50021/synthesis?speaker=${SPEAKER_ID}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(queryJson),
-          },
-        );
+        try {
+          const queryRes = await fetch(
+            `http://localhost:50021/audio_query?text=${encodeURIComponent(text)}&speaker=${SPEAKER_ID}`,
+            { method: "POST" },
+          );
+          const queryJson = await queryRes.json();
+          queryJson.speedScale = 1.2;
 
-        const blob = await synthRes.blob();
-        const audio = new Audio(URL.createObjectURL(blob));
+          const synthRes = await fetch(
+            `http://localhost:50021/synthesis?speaker=${SPEAKER_ID}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(queryJson),
+            },
+          );
 
-        // 音声の再生が終わるまで待機
-        return new Promise((resolve) => {
-          audio.onended = resolve;
-          audio.play();
-        });
+          const blob = await synthRes.blob();
+          const audio = new Audio(URL.createObjectURL(blob));
+
+          return new Promise((resolve) => {
+            audio.onended = resolve;
+            audio.onerror = resolve; // エラー時も次へ
+            audio.play();
+          });
+        } catch (e) {
+          console.error("VOICEVOX Error:", e);
+          return;
+        }
       }
     </script>
   </body>
